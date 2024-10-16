@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# set -euo pipefail
-
 # Function to URL-encode a string correctly handling UTF-8 characters
 urlencode() {
     local string="$1"
@@ -53,17 +51,21 @@ safe_curl() {
 
 # Function to get all groups with pagination
 get_all_groups() {
-    local page=1
-    local per_page=100
-    while :; do
-        local response=$(safe_curl "${GITLAB_API_URL}groups?per_page=$per_page&page=$page") || break
-        local group_count=$(echo "$response" | jq 'length')
-        if [[ $group_count -eq 0 ]]; then
-            break
-        fi
-        echo "$response" | jq -r '.[].id'
-        ((page++))
-    done
+    if [[ "$SCRAPE_MODE" == "group" ]]; then
+        echo "$GROUP_ID"
+    else
+        local page=1
+        local per_page=100
+        while :; do
+            local response=$(safe_curl "${GITLAB_API_URL}groups?per_page=$per_page&page=$page") || break
+            local group_count=$(echo "$response" | jq 'length')
+            if [[ $group_count -eq 0 ]]; then
+                break
+            fi
+            echo "$response" | jq -r '.[].id'
+            ((page++))
+        done
+    fi
 }
 
 # Function to get all projects in a group with pagination
@@ -78,6 +80,23 @@ get_projects_in_group() {
             break
         fi
         echo "$response" | jq -r '.[].id'
+        ((page++))
+    done
+}
+
+
+# Function to get all members of a group
+get_group_members() {
+    local group_id="$1"
+    local page=1
+    local per_page=100
+    while :; do
+        local response=$(safe_curl "${GITLAB_API_URL}groups/${group_id}/members/all?per_page=$per_page&page=$page") || break
+        local member_count=$(echo "$response" | jq 'length')
+        if [[ $member_count -eq 0 ]]; then
+            break
+        fi
+        echo "$response" | jq -c '.[]'
         ((page++))
     done
 }
@@ -97,17 +116,19 @@ get_all_projects() {
         done < <(get_projects_in_group "$group_id")
     done < <(get_all_groups)
 
-    # Fetch personal projects from users
-    while IFS= read -r user_json; do
-        local user_id
-        user_id=$(echo "$user_json" | jq -r '.id')
-        while IFS= read -r project_id; do
-            if [[ -z "${seen_projects[$project_id]:-}" ]]; then
-                echo "$project_id"
-                seen_projects["$project_id"]=1
-            fi
-        done < <(get_personal_projects_for_user "$user_id")
-    done < <(get_all_users)
+    if [[ "$SCRAPE_MODE" != "group" ]]; then
+        # Fetch personal projects from users
+        while IFS= read -r user_json; do
+            local user_id
+            user_id=$(echo "$user_json" | jq -r '.id')
+            while IFS= read -r project_id; do
+                if [[ -z "${seen_projects[$project_id]:-}" ]]; then
+                    echo "$project_id"
+                    seen_projects["$project_id"]=1
+                fi
+            done < <(get_personal_projects_for_user "$user_id")
+        done < <(get_all_users)
+    fi
 }
 
 # Function to get all personal projects for a user with pagination
@@ -178,10 +199,10 @@ process_commits_for_project() {
     local -n repo_commit_count_ref="$3"
     local -n total_commits_ref="$4"
     local commit_count=0
-    echo -n "process_commits_for_project: $project_id,"
+    echo -n "Processing commits for project: $project_id, "
     local commits_encoded=$(get_commits_for_project "$project_id")
     local commits_length=${#commits_encoded}
-    echo -n "commits_length: $commits_length,"
+    echo -n "Number of commits fetched: $commits_length, "
     for commit_enc in $commits_encoded; do
         if [[ -z "$commit_enc" ]]; then
             continue
@@ -198,23 +219,26 @@ process_commits_for_project() {
     done
 
     repo_commit_count_ref["$project_id"]=$commit_count
-    echo -n "commit_count: $commit_count,"
+    echo "Commits processed: $commit_count"
 }
 # Function to get all users with pagination
 get_all_users() {
-    local page=1
-    local per_page=100
-    while :; do
-        local response=$(safe_curl "${GITLAB_API_URL}users?per_page=$per_page&page=$page") || break
-        local user_count=$(echo "$response" | jq 'length')
-        if [[ $user_count -eq 0 ]]; then
-            break
-        fi
-        echo "$response" | jq -c '.[]'
-        ((page++))
-    done
+    if [[ "$SCRAPE_MODE" == "group" ]]; then
+        get_group_members "$GROUP_ID"
+    else
+        local page=1
+        local per_page=100
+        while :; do
+            local response=$(safe_curl "${GITLAB_API_URL}users?per_page=$per_page&page=$page") || break
+            local user_count=$(echo "$response" | jq 'length')
+            if [[ $user_count -eq 0 ]]; then
+                break
+            fi
+            echo "$response" | jq -c '.[]'
+            ((page++))
+        done
+    fi
 }
-
 # Function to get all personal projects across all users
 get_all_personal_projects() {
     declare -A seen_projects
@@ -242,7 +266,7 @@ gitlab_user_statistics() {
     local passive_users=0
     projects=()
     personal_projects=()
-    
+
     # All Users Count
     local all_users_count=0
     while IFS= read -r user_json; do
@@ -258,15 +282,17 @@ gitlab_user_statistics() {
     local total_repos=${#projects[@]}
     metric_add "gitlab_total_repositories{gitlab=\"${GITLAB_URL}\"} $total_repos"
 
-    # Populate the personal_projects array with personal projects
-    while IFS= read -r project_id; do
-        personal_projects+=("$project_id")
-    done < <(get_all_personal_projects)
-    
-    # Add total user (personal) projects metric
-    local total_user_projects=${#personal_projects[@]}
-    metric_add "gitlab_total_user_projects{gitlab=\"${GITLAB_URL}\"} $total_user_projects"
-    
+    if [[ "$SCRAPE_MODE" != "group" ]]; then
+        # Populate the personal_projects array with personal projects
+        while IFS= read -r project_id; do
+            personal_projects+=("$project_id")
+        done < <(get_all_personal_projects)
+
+        # Add total user (personal) projects metric
+        local total_user_projects=${#personal_projects[@]}
+        metric_add "gitlab_total_user_projects{gitlab=\"${GITLAB_URL}\"} $total_user_projects"
+    fi
+
     # Process commits and add repository commit metrics for each project
     for project in "${projects[@]}"; do
         # Fetch project info
@@ -275,41 +301,41 @@ gitlab_user_statistics() {
         local namespace=$(echo "$project_info" | jq -r '.namespace.name')
         project_names["$project"]="$project_name"
         namespaces["$project"]="$namespace"
-        
+
         # Process commits for the current project
         process_commits_for_project "$project" user_commit_count repo_commit_count total_commits
-        
+
         # Add repository commits metric for the current project
         local commit_count=${repo_commit_count["$project"]}
         local sanitized_project_name=$(escape_label_value "$project_name")
         local sanitized_namespace=$(escape_label_value "$namespace")
-        metric_add "gitlab_repo_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",project_id=\"$project\",project_name=\"$sanitized_project_name\",namespace=\"$sanitized_namespace\"} $commit_count" # ${MICROTIME}"
+        metric_add "gitlab_repo_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",project_id=\"$project\",project_name=\"$sanitized_project_name\",namespace=\"$sanitized_namespace\"} $commit_count"
     done
-    
+
     # Add commit metrics per user
     for email in "${!user_commit_count[@]}"; do
         local commit_count=${user_commit_count[$email]}
         local sanitized_email=$(escape_label_value "$email")
-        metric_add "gitlab_user_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",user_email=\"$sanitized_email\"} $commit_count" # ${MICROTIME}"
+        metric_add "gitlab_user_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",user_email=\"$sanitized_email\"} $commit_count"
     done
-    
+
     # Add total commits metric
-    metric_add "gitlab_total_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_commits" # ${MICROTIME}"
-    
+    metric_add "gitlab_total_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_commits"
+
     # Add active users metric
     local total_unique_users=${#user_commit_count[@]}
-    metric_add "gitlab_active_users{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_unique_users" # ${MICROTIME}"
-    
-    # Passive Users  
+    metric_add "gitlab_active_users{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_unique_users"
+
+    # Passive Users
     while IFS= read -r user_json; do
         local last_sign_in_at=$(echo "$user_json" | jq -r '.last_sign_in_at')
         if [[ "$last_sign_in_at" != "null" && -n "$last_sign_in_at" ]]; then
             local last_sign_in_epoch=$(date -d "$last_sign_in_at" +"%s" 2>/dev/null)
-            
-            # Check if last_sign_in_at is before SINCE_DATE_EPOCH
+
+            # Check if last_sign_in_at is after SINCE_DATE_EPOCH
             if [[ "$last_sign_in_epoch" -ge "$SINCE_DATE_EPOCH" ]]; then
                 local email=$(echo "$user_json" | jq -r '.email' | tr '[:upper:]' '[:lower:]' | xargs)
-                
+
                 # Ensure the user hasn't made any commits
                 if [[ -z "${user_commit_count[$email]:-}" ]]; then
                     passive_users=$((passive_users + 1))
@@ -317,14 +343,17 @@ gitlab_user_statistics() {
             fi
         fi
     done < <(get_all_users)
-    
-    metric_add "gitlab_passive_users{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $passive_users" # ${MICROTIME}"
+
+    metric_add "gitlab_passive_users{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $passive_users"
 }
 
+
 # Configuration Variables
-GITLAB_URL=${GITLAB_URL:-"https://gitlab.example.com"}
+GITLAB_URL=${GITLAB_URL:-"https://gitlab.com"}
 GITLAB_API_URL="${GITLAB_URL}/api/v4/"
 PRIVATE_TOKEN=${PRIVATE_TOKEN:-"your_access_token"}
+GROUP_ID=${GROUP_ID:-""}  # Specify your group ID here if using 'group' mode
+SCRAPE_MODE=${SCRAPE_MODE:-"group"}  # Set to 'group' or 'all'
 RUN_BEFORE_MINUTE=${RUN_BEFORE_MINUTE:-"5"}
 RUN_AT_HOUR=${RUN_AT_HOUR:-"1"}
 START_DATE=${START_DATE:-"30 days ago"}
@@ -336,7 +365,6 @@ EPOCH=$(date +%s)
 CURRENT_MIN=$((10#$(date +%M)))
 CURRENT_HOUR=$(date +"%-H")
 curl_request_count=0
-
 
 # Run only once a day
 if [[ $CURRENT_HOUR -eq ${RUN_AT_HOUR} ]] && [[ $CURRENT_MIN -lt ${RUN_BEFORE_MINUTE} ]]; then
