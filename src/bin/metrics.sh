@@ -49,10 +49,32 @@ safe_curl() {
     return 1
 }
 
+# Function to get all subgroups recursively
+get_all_subgroups() {
+    local parent_group_id="$1"
+    echo "$parent_group_id"  # Include the parent group itself
+    local page=1
+    local per_page=100
+    while :; do
+        local response=$(safe_curl "${GITLAB_API_URL}groups/${parent_group_id}/subgroups?per_page=${per_page}&page=${page}") || break
+        local subgroup_count=$(echo "$response" | jq 'length')
+        if [[ $subgroup_count -eq 0 ]]; then
+            break
+        fi
+        local subgroup_ids=$(echo "$response" | jq -r '.[].id')
+        for subgroup_id in $subgroup_ids; do
+            # Recursively get subgroups
+            get_all_subgroups "$subgroup_id"
+        done
+        ((page++))
+    done
+}
+
 # Function to get all groups with pagination
 get_all_groups() {
     if [[ "$SCRAPE_MODE" == "group" ]]; then
-        echo "$GROUP_ID"
+        # Get all subgroups including the parent group
+        get_all_subgroups "$GROUP_ID"
     else
         local page=1
         local per_page=100
@@ -67,23 +89,6 @@ get_all_groups() {
         done
     fi
 }
-
-# Function to get all projects in a group with pagination
-get_projects_in_group() {
-    local group_id="$1"
-    local page=1
-    local per_page=100
-    while :; do
-        local response=$(safe_curl "${GITLAB_API_URL}groups/${group_id}/projects?per_page=${per_page}&page=${page}&with_shared=false") || break
-        local project_count=$(echo "$response" | jq 'length')
-        if [[ $project_count -eq 0 ]]; then
-            break
-        fi
-        echo "$response" | jq -r '.[].id'
-        ((page++))
-    done
-}
-
 
 # Function to get all members of a group
 get_group_members() {
@@ -101,22 +106,77 @@ get_group_members() {
     done
 }
 
-# Function to get all projects including group and personal projects
+# Function to get all users with pagination
+get_all_users() {
+    if [[ "$SCRAPE_MODE" == "group" ]]; then
+        declare -A seen_users
+        # Get members from all groups (parent and subgroups)
+        while IFS= read -r group_id; do
+            while IFS= read -r user_json; do
+                local user_id=$(echo "$user_json" | jq -r '.id')
+                if [[ -z "${seen_users[$user_id]:-}" ]]; then
+                    echo "$user_json"
+                    seen_users["$user_id"]=1
+                fi
+            done < <(get_group_members "$group_id")
+        done < <(get_all_groups)
+    else
+        local page=1
+        local per_page=100
+        while :; do
+            local response=$(safe_curl "${GITLAB_API_URL}users?per_page=$per_page&page=$page") || break
+            local user_count=$(echo "$response" | jq 'length')
+            if [[ $user_count -eq 0 ]]; then
+                break
+            fi
+            echo "$response" | jq -c '.[]'
+            ((page++))
+        done
+    fi
+}
+
+# Function to get all projects in a group with pagination
+get_projects_in_group() {
+    local group_id="$1"
+    local page=1
+    local per_page=100
+    while :; do
+        local response=$(safe_curl "${GITLAB_API_URL}groups/${group_id}/projects?per_page=${per_page}&page=${page}") || break
+        local project_count=$(echo "$response" | jq 'length')
+        if [[ $project_count -eq 0 ]]; then
+            break
+        fi
+        echo "$response" | jq -r '.[].id'
+        ((page++))
+    done
+}
+
+# Function to get all projects including subgroups
 get_all_projects() {
     declare -A seen_projects
     local project_id
 
-    # Fetch projects from groups
-    while IFS= read -r group_id; do
-        while IFS= read -r project_id; do
-            if [[ -z "${seen_projects[$project_id]:-}" ]]; then
-                echo "$project_id"
-                seen_projects["$project_id"]=1
-            fi
-        done < <(get_projects_in_group "$group_id")
-    done < <(get_all_groups)
+    if [[ "$SCRAPE_MODE" == "group" ]]; then
+        # Fetch projects from all groups (parent and subgroups)
+        while IFS= read -r group_id; do
+            while IFS= read -r project_id; do
+                if [[ -z "${seen_projects[$project_id]:-}" ]]; then
+                    echo "$project_id"
+                    seen_projects["$project_id"]=1
+                fi
+            done < <(get_projects_in_group "$group_id")
+        done < <(get_all_groups)
+    else
+        # Fetch projects from all groups
+        while IFS= read -r group_id; do
+            while IFS= read -r project_id; do
+                if [[ -z "${seen_projects[$project_id]:-}" ]]; then
+                    echo "$project_id"
+                    seen_projects["$project_id"]=1
+                fi
+            done < <(get_projects_in_group "$group_id")
+        done < <(get_all_groups)
 
-    if [[ "$SCRAPE_MODE" != "group" ]]; then
         # Fetch personal projects from users
         while IFS= read -r user_json; do
             local user_id
@@ -221,40 +281,6 @@ process_commits_for_project() {
     repo_commit_count_ref["$project_id"]=$commit_count
     echo "Commits processed: $commit_count"
 }
-# Function to get all users with pagination
-get_all_users() {
-    if [[ "$SCRAPE_MODE" == "group" ]]; then
-        get_group_members "$GROUP_ID"
-    else
-        local page=1
-        local per_page=100
-        while :; do
-            local response=$(safe_curl "${GITLAB_API_URL}users?per_page=$per_page&page=$page") || break
-            local user_count=$(echo "$response" | jq 'length')
-            if [[ $user_count -eq 0 ]]; then
-                break
-            fi
-            echo "$response" | jq -c '.[]'
-            ((page++))
-        done
-    fi
-}
-# Function to get all personal projects across all users
-get_all_personal_projects() {
-    declare -A seen_projects
-    local personal_project_id
-
-    # Fetch personal projects from each user
-    while IFS= read -r user_json; do
-        local user_id=$(echo "$user_json" | jq -r '.id')
-        while IFS= read -r project_id; do
-            if [[ -z "${seen_projects[$project_id]:-}" ]]; then
-                echo "$project_id"
-                seen_projects["$project_id"]=1
-            fi
-        done < <(get_personal_projects_for_user "$user_id")
-    done < <(get_all_users)
-}
 
 # Function to collect GitLab user statistics and commits per repository
 gitlab_user_statistics() {
@@ -272,8 +298,8 @@ gitlab_user_statistics() {
     while IFS= read -r user_json; do
         all_users_count=$((all_users_count + 1))
     done < <(get_all_users)
-    metric_add "gitlab_total_users{gitlab=\"${GITLAB_URL}\"} $all_users_count" # ${MICROTIME}"
-    
+    metric_add "gitlab_total_users{gitlab=\"${GITLAB_URL}\"} $all_users_count"
+
     # Populate the projects array
     while IFS= read -r project_id; do
         projects+=("$project_id")
@@ -347,6 +373,22 @@ gitlab_user_statistics() {
     metric_add "gitlab_passive_users{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $passive_users"
 }
 
+# Function to get all personal projects across all users
+get_all_personal_projects() {
+    declare -A seen_projects
+    local personal_project_id
+
+    # Fetch personal projects from each user
+    while IFS= read -r user_json; do
+        local user_id=$(echo "$user_json" | jq -r '.id')
+        while IFS= read -r project_id; do
+            if [[ -z "${seen_projects[$project_id]:-}" ]]; then
+                echo "$project_id"
+                seen_projects["$project_id"]=1
+            fi
+        done < <(get_personal_projects_for_user "$user_id")
+    done < <(get_all_users)
+}
 
 # Configuration Variables
 GITLAB_URL=${GITLAB_URL:-"https://gitlab.com"}
