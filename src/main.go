@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -89,21 +88,30 @@ func ensureLogFileExists() {
 }
 
 func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// Handler for the /metrics path
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		ensureLogFileExists()
 
 		// Read the contents of the metrics log file.
-		contents, err := ioutil.ReadFile("/tmp/metrics.log")
+		contents, err := os.ReadFile("/tmp/metrics.log")
 		if err != nil {
 			w.WriteHeader(http.StatusInternalServerError)
 			fmt.Fprintf(w, "Error reading /tmp/metrics.log: %v", err)
 			return
 		}
 		// Serve the contents of the metrics log file.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, string(contents))
 
 		// Attempt to execute the script asynchronously.
 		go executeScript()
+	})
+
+	// Default handler for all other paths
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
 	})
 
 	fmt.Println("Server is listening on port 9199...")
