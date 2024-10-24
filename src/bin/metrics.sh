@@ -276,16 +276,15 @@ process_commits_for_project() {
 
         local commit=$(echo "$commit_enc" | base64 --decode 2>/dev/null) || continue
         local sha=$(echo "$commit" | jq -r '.id')
+        local email=$(echo "$commit" | jq -r '.author_email' | tr '[:upper:]' '[:lower:]' | xargs)
 
-        # Fetch commit details including stats
-        local commit_detail=$(safe_curl "${GITLAB_API_URL}projects/${project_id}/repository/commits/${sha}") || continue
+        user_commit_count_ref["$email"]=$(( ${user_commit_count_ref["$email"]:-0} + 1 ))
+        total_commits_ref=$(( total_commits_ref + 1 ))
+        commit_count=$((commit_count + 1))
 
-        local email=$(echo "$commit_detail" | jq -r '.author_email' | tr '[:upper:]' '[:lower:]' | xargs)
-
-        if [[ -n "$email" && "$email" != "null" && "$email" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]]; then
-            user_commit_count_ref["$email"]=$(( ${user_commit_count_ref["$email"]:-0} + 1 ))
-            total_commits_ref=$(( total_commits_ref + 1 ))
-            commit_count=$((commit_count + 1))
+        if [[ "$ENABLE_LINE_STATS" == "true" ]]; then
+            # Fetch commit details including stats
+            local commit_detail=$(safe_curl "${GITLAB_API_URL}projects/${project_id}/repository/commits/${sha}") || continue
 
             # Extract additions and deletions
             local additions=$(echo "$commit_detail" | jq -r '.stats.additions')
@@ -316,18 +315,22 @@ process_commits_for_project() {
 gitlab_user_statistics() {
     declare -A user_commit_count
     declare -A repo_commit_count
-    declare -A user_lines_added
-    declare -A user_lines_removed
-    declare -A repo_lines_added
-    declare -A repo_lines_removed
     declare -A project_names
     declare -A namespaces
     local total_commits=0
-    local total_lines_added=0
-    local total_lines_removed=0
     local passive_users=0
     projects=()
     personal_projects=()
+
+    # Initialize arrays for line stats if enabled
+    if [[ "$ENABLE_LINE_STATS" == "true" ]]; then
+        declare -A user_lines_added
+        declare -A user_lines_removed
+        declare -A repo_lines_added
+        declare -A repo_lines_removed
+        local total_lines_added=0
+        local total_lines_removed=0
+    fi
 
     # All Users Count
     local all_users_count=0
@@ -365,7 +368,11 @@ gitlab_user_statistics() {
         namespaces["$project"]="$namespace"
 
         # Process commits for the current project
-        process_commits_for_project "$project" user_commit_count repo_commit_count total_commits user_lines_added user_lines_removed repo_lines_added repo_lines_removed total_lines_added total_lines_removed
+        if [[ "$ENABLE_LINE_STATS" == "true" ]]; then
+            process_commits_for_project "$project" user_commit_count repo_commit_count total_commits user_lines_added user_lines_removed repo_lines_added repo_lines_removed total_lines_added total_lines_removed
+        else
+            process_commits_for_project "$project" user_commit_count repo_commit_count total_commits
+        fi
 
         # Add repository commits metric for the current project
         local commit_count=${repo_commit_count["$project"]}
@@ -381,30 +388,32 @@ gitlab_user_statistics() {
         metric_add "gitlab_user_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",user_email=\"$sanitized_email\"} $commit_count"
     done
 
-    # Output per-user lines added and removed metrics
-    for email in "${!user_lines_added[@]}"; do
-        local additions=${user_lines_added[$email]}
-        local deletions=${user_lines_removed[$email]}
-        local sanitized_email=$(escape_label_value "$email")
+    if [[ "$ENABLE_LINE_STATS" == "true" ]]; then
+        # Output per-user lines added and removed metrics
+        for email in "${!user_lines_added[@]}"; do
+            local additions=${user_lines_added[$email]}
+            local deletions=${user_lines_removed[$email]}
+            local sanitized_email=$(escape_label_value "$email")
 
-        metric_add "gitlab_user_lines_added{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",user_email=\"$sanitized_email\"} $additions"
-        metric_add "gitlab_user_lines_removed{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",user_email=\"$sanitized_email\"} $deletions"
-    done
+            metric_add "gitlab_user_lines_added{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",user_email=\"$sanitized_email\"} $additions"
+            metric_add "gitlab_user_lines_removed{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",user_email=\"$sanitized_email\"} $deletions"
+        done
 
-    # Output per-project lines added and removed metrics
-    for project in "${!repo_lines_added[@]}"; do
-        local additions=${repo_lines_added[$project]}
-        local deletions=${repo_lines_removed[$project]}
-        local sanitized_project_name=$(escape_label_value "${project_names[$project]}")
-        local sanitized_namespace=$(escape_label_value "${namespaces[$project]}")
+        # Output per-project lines added and removed metrics
+        for project in "${!repo_lines_added[@]}"; do
+            local additions=${repo_lines_added[$project]}
+            local deletions=${repo_lines_removed[$project]}
+            local sanitized_project_name=$(escape_label_value "${project_names[$project]}")
+            local sanitized_namespace=$(escape_label_value "${namespaces[$project]}")
 
-        metric_add "gitlab_repo_lines_added{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",project_id=\"$project\",project_name=\"$sanitized_project_name\",namespace=\"$sanitized_namespace\"} $additions"
-        metric_add "gitlab_repo_lines_removed{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",project_id=\"$project\",project_name=\"$sanitized_project_name\",namespace=\"$sanitized_namespace\"} $deletions"
-    done
+            metric_add "gitlab_repo_lines_added{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",project_id=\"$project\",project_name=\"$sanitized_project_name\",namespace=\"$sanitized_namespace\"} $additions"
+            metric_add "gitlab_repo_lines_removed{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\",project_id=\"$project\",project_name=\"$sanitized_project_name\",namespace=\"$sanitized_namespace\"} $deletions"
+        done
 
-    # Output total lines added and removed metrics
-    metric_add "gitlab_total_lines_added{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_lines_added"
-    metric_add "gitlab_total_lines_removed{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_lines_removed"
+        # Output total lines added and removed metrics
+        metric_add "gitlab_total_lines_added{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_lines_added"
+        metric_add "gitlab_total_lines_removed{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_lines_removed"
+    fi
 
     # Add total commits metric
     metric_add "gitlab_total_commits{gitlab=\"${GITLAB_URL}\",start_date=\"${START_DATE}\"} $total_commits"
@@ -460,6 +469,7 @@ SCRAPE_MODE=${SCRAPE_MODE:-"group"}  # Set to 'group' or 'all'
 RUN_BEFORE_MINUTE=${RUN_BEFORE_MINUTE:-"5"}
 RUN_AT_HOUR=${RUN_AT_HOUR:-"1"}
 START_DATE=${START_DATE:-"30 days ago"}
+ENABLE_LINE_STATS=${ENABLE_LINE_STATS:-"false"}
 SINCE_DATE_EPOCH=$(date -d "${START_DATE}" +"%s")
 SINCE_DATE=$(date -d "${START_DATE}" +"%Y-%m-%dT00:00:00Z")
 UNTIL_DATE=$(date +"%Y-%m-%dT23:59:59Z")
