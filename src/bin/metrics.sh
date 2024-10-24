@@ -238,7 +238,7 @@ get_commits_for_project() {
         local page=1
         local per_page=100
         while :; do
-            local url="${GITLAB_API_URL}projects/${project_id}/repository/commits?ref_name=${encoded_branch}&since=${SINCE_DATE}&until=${UNTIL_DATE}&page=${page}&per_page=${per_page}&stats=true"
+            local url="${GITLAB_API_URL}projects/${project_id}/repository/commits?ref_name=${encoded_branch}&since=${SINCE_DATE}&until=${UNTIL_DATE}&page=${page}&per_page=${per_page}"
             local response=$(safe_curl "$url") || break
             local commit_count=$(echo "$response" | jq 'length')
             if [[ $commit_count -eq 0 ]]; then
@@ -267,15 +267,20 @@ process_commits_for_project() {
     local commit_count=0
     echo -n "Processing commits for project: $project_id, "
     local commits_encoded=$(get_commits_for_project "$project_id")
-    local commits_length=${#commits_encoded}
-    echo -n "Number of commits fetched: $commits_length, "
+    local commits_length=$(echo "$commits_encoded" | wc -w)
+    echo "Number of commits fetched: $commits_length"
     for commit_enc in $commits_encoded; do
         if [[ -z "$commit_enc" ]]; then
             continue
         fi
 
         local commit=$(echo "$commit_enc" | base64 --decode 2>/dev/null) || continue
-        local email=$(echo "$commit" | jq -r '.author_email' | tr '[:upper:]' '[:lower:]' | xargs)
+        local sha=$(echo "$commit" | jq -r '.id')
+
+        # Fetch commit details including stats
+        local commit_detail=$(safe_curl "${GITLAB_API_URL}projects/${project_id}/repository/commits/${sha}") || continue
+
+        local email=$(echo "$commit_detail" | jq -r '.author_email' | tr '[:upper:]' '[:lower:]' | xargs)
 
         if [[ -n "$email" && "$email" != "null" && "$email" =~ ^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$ ]]; then
             user_commit_count_ref["$email"]=$(( ${user_commit_count_ref["$email"]:-0} + 1 ))
@@ -283,8 +288,8 @@ process_commits_for_project() {
             commit_count=$((commit_count + 1))
 
             # Extract additions and deletions
-            local additions=$(echo "$commit" | jq -r '.stats.additions')
-            local deletions=$(echo "$commit" | jq -r '.stats.deletions')
+            local additions=$(echo "$commit_detail" | jq -r '.stats.additions')
+            local deletions=$(echo "$commit_detail" | jq -r '.stats.deletions')
 
             # Ensure additions and deletions are numbers
             if [[ "$additions" =~ ^[0-9]+$ && "$deletions" =~ ^[0-9]+$ ]]; then
