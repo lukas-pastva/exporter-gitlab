@@ -7,9 +7,19 @@ urlencode() {
     printf '%s' "$string" | jq -s -R -r @uri
 }
 
-# Function to add metrics
+# Function to add metrics (modified to skip zero values)
 metric_add() {
     local metric="$1"
+
+    # Extract the value from the metric
+    local value=$(echo "$metric" | awk '{print $NF}')
+
+    # Check if the value is zero
+    if [[ "$value" == "0" ]]; then
+        # echo "Metric value is zero, skipping: $metric" >&2
+        return
+    fi
+
     if ! grep -Fxq "$metric" /tmp/metrics.log; then
         echo "$metric" >> /tmp/metrics.log
         echo "$metric"
@@ -469,7 +479,7 @@ SCRAPE_MODE=${SCRAPE_MODE:-"group"}  # Set to 'group' or 'all'
 RUN_BEFORE_MINUTE=${RUN_BEFORE_MINUTE:-"5"}
 RUN_AT_HOUR=${RUN_AT_HOUR:-"1"}
 START_DATE=${START_DATE:-"30 days ago"}
-ENABLE_LINE_STATS=${ENABLE_LINE_STATS:-"false"}
+ENABLE_LINE_STATS=${ENABLE_LINE_STATS:-"false"}  # Set to 'true' to enable line stats
 SINCE_DATE_EPOCH=$(date -d "${START_DATE}" +"%s")
 SINCE_DATE=$(date -d "${START_DATE}" +"%Y-%m-%dT00:00:00Z")
 UNTIL_DATE=$(date +"%Y-%m-%dT23:59:59Z")
